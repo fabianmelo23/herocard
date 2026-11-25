@@ -17,7 +17,7 @@ const errMsg = (e) => { const k = `err_${e?.code}`; const m = t(k); return m ===
 const ITEM = Object.fromEntries(ALL_ITEMS.map((i) => [i.key, i]));
 const CAT = Object.fromEntries(CHECKLIST.map((c) => [c.key, c]));
 
-const state = { user: null, installPrompt: null };
+const state = { user: null, installPrompt: null, demo: false };
 
 // ---------------------------------------------------------------- theme
 function applyTheme() {
@@ -179,6 +179,9 @@ function route() {
 addEventListener('hashchange', route);
 
 // ---------------------------------------------------------------- login / register
+// Same rules as server/security.js (the server is the authority; this is just fast feedback).
+const passwordProblem = (pw) => (pw.length < 8 ? 'password_too_short' : pw.length > 128 ? 'password_too_long'
+  : !/[A-Za-zÀ-ÿ]/.test(pw) || !/\d/.test(pw) ? 'password_weak' : null);
 // Password input with a show/hide eye button (wired by one delegated handler below).
 function pwField(name, labelText, autocomplete, extra = '') {
   return `<label class="field"><span>${labelText}</span>
@@ -235,7 +238,7 @@ function renderLogin(mode = 'login') {
         <button class="btn btn-primary btn-lg btn-block" type="submit">${t(reg ? 'register' : 'sign_in')}</button>
         <p class="switch-mode">${t(reg ? 'have_account' : 'no_account')} <button type="button" class="link" data-mode="${reg ? 'login' : 'register'}">${t(reg ? 'sign_in' : 'register_here')}</button></p>
         <div class="lang-switch">${['en', 'es'].map((l) => `<button type="button" data-lang="${l}" class="${getLang() === l ? 'on' : ''}">${l === 'en' ? 'English' : 'Español'}</button>`).join('')}</div>
-        ${reg ? '' : `<details class="demo">
+        ${reg || !state.demo ? '' : `<details class="demo">
           <summary>${icon('sparkles', 16)} ${t('demo_accounts')}</summary>
           <div class="demo-grid">
             <button type="button" data-demo="worker@herocard.app">${icon('hardhat', 18)}<div><b>${t('worker')}</b><span>worker@herocard.app</span></div></button>
@@ -262,7 +265,8 @@ function renderLogin(mode = 'login') {
     if (reg) {
       body = Object.fromEntries(new FormData(form));
       if (Object.values(body).some((v) => !String(v).trim())) return fail(t('err_missing_fields'));
-      if (body.password.length < 8) return fail(t('err_password_too_short'));
+      const pwErr = passwordProblem(body.password);
+      if (pwErr) return fail(t('err_' + pwErr));
       if (body.password !== body.confirm) return fail(t('err_password_mismatch'));
     } else body = { email: form.email.value, password: form.password.value };
     btn.disabled = true; btn.textContent = t(reg ? 'registering' : 'signing_in');
@@ -661,18 +665,16 @@ function emailDialog(card) {
   modal(`
     <h2>${icon('mail', 22)} ${t('send_email')}</h2>
     <p class="muted">${t('email_explain')}</p>
-    <label class="field"><span>${t('recipient')}</span><input type="email" id="to" value="${esc(card.user_email)}" inputmode="email" autocomplete="off"/></label>
+    <div class="field"><span>${t('recipient')}</span><div class="recipient">${icon('user', 16)}<b>${esc(card.user_name)}</b><span>${esc(card.user_email)}</span></div></div>
     <div class="attach-chip">${icon('fileText', 18)}<div><b>HERO-Card-${card.id}.pdf</b><span>${t('attached')}</span></div></div>
     <p class="form-error" hidden></p>
     <div class="modal-actions"><button class="btn btn-ghost" data-close>${t('cancel')}</button><button class="btn btn-primary" id="send">${icon('mail', 16)} ${t('send')}</button></div>`,
   (m, close) => {
     const btn = $('#send', m), err = $('.form-error', m);
     btn.addEventListener('click', async () => {
-      const to = $('#to', m).value.trim();
-      if (!/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(to)) { err.textContent = t('err_invalid_email'); err.hidden = false; return; }
       btn.disabled = true; btn.textContent = t('sending'); err.hidden = true;
       try {
-        const r = await api(`/api/cards/${card.id}/email`, { method: 'POST', body: { to, lang: getLang() } });
+        const r = await api(`/api/cards/${card.id}/email`, { method: 'POST', body: { lang: getLang() } });
         close();
         toast(r.mode === 'preview' ? t('email_preview', { to: r.to }) : t('email_sent', { to: r.to }), r.mode === 'preview' ? 'info' : 'ok');
       } catch (e) {
@@ -932,7 +934,19 @@ async function boot() {
 }
 
 (async function init() {
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) {
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || reloaded) return;
+      reloaded = true;
+      if (location.hash.startsWith('#/new')) toast(t('app_updated')); // keep the draft on screen
+      else { sessionStorage.setItem('hc_updated', '1'); location.reload(); }
+    });
+    if (sessionStorage.getItem('hc_updated')) { sessionStorage.removeItem('hc_updated'); setTimeout(() => toast(t('app_updated')), 600); }
+  }
+  try { state.demo = (await api('/api/config')).demo; } catch { state.demo = false; }
   try {
     const { user } = await api('/api/auth/me');
     state.user = user;

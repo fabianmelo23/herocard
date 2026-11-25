@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { hashPassword } from './auth.js';
+import { hashPasswordSync as hashPassword } from './auth.js';
 import { ALL_ITEMS } from '../public/js/checklist.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -66,8 +66,19 @@ CREATE TABLE IF NOT EXISTS card_items (
 `);
 
 // ---- Demo seed (only on an empty database) ---------------------------------
+// Demo data (known password "Hero2026!") is only created in demo mode. In production set
+// NODE_ENV=production and ADMIN_EMAIL / ADMIN_PASSWORD to create the first supervisor instead.
+export const DEMO_MODE = process.env.DEMO_MODE ? process.env.DEMO_MODE === '1' : process.env.NODE_ENV !== 'production';
+
+// Session tokens are now stored hashed; drop any legacy plaintext sessions once.
+db.exec(`DELETE FROM sessions WHERE length(token) <> 64`);
+
 const { n } = db.prepare('SELECT COUNT(*) AS n FROM users').get();
-if (n === 0) {
+if (n === 0 && !DEMO_MODE && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
+  db.prepare(`INSERT INTO users (name,email,password_hash,role,observer_id,craft) VALUES (?,?,?,?,?,?)`)
+    .run(process.env.ADMIN_NAME || 'Administrator', process.env.ADMIN_EMAIL.toLowerCase(), hashPassword(process.env.ADMIN_PASSWORD), 'supervisor', 'SUP-0001', 'Safety');
+}
+if (n === 0 && DEMO_MODE) {
   const insert = db.prepare(`INSERT INTO users (name,email,password_hash,role,observer_id,craft,supervisor_id)
                              VALUES (?,?,?,?,?,?,?)`);
   const sup = insert.run('Maria Lopez', 'supervisor@herocard.app', hashPassword('Hero2026!'), 'supervisor', 'SUP-1001', 'Safety', null);

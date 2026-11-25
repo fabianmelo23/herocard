@@ -7,10 +7,11 @@ import { existsSync } from 'node:fs';
 const ENV_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', '.env');
 if (existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
 
-const { db } = await import('./db.js');
+const { db, DEMO_MODE } = await import('./db.js');
 const { cardPdf } = await import('./pdf.js');
 const { sendMail, cardEmail, mailConfigured } = await import('./mailer.js');
-import { hashPassword, verifyPassword, newToken } from './auth.js';
+import { hashPassword, verifyPassword, newToken, DUMMY_HASH } from './auth.js';
+import { securityHeaders, sameOriginOnly, RateLimiter, hashToken, passwordProblem, EMAIL_RE } from './security.js';
 import { ALL_ITEMS, ITEM_KEYS, RATINGS, CHECKLIST } from '../public/js/checklist.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -18,17 +19,17 @@ const PORT = Number(process.env.PORT) || 3000;
 const SESSION_DAYS = 30;
 const COOKIE = 'hc_session';
 
-const HOST = process.env.HOST || '0.0.0.0';
+// Bind to localhost by default; set HOST=0.0.0.0 to test from other devices on the LAN.
+const HOST = process.env.HOST || '127.0.0.1';
+// Only trust X-Forwarded-* when actually behind a reverse proxy (set TRUST_PROXY=1 there).
+// Trusting it blindly lets clients spoof their IP and bypass rate limits.
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1); // behind Nginx: real client IP + https detection
-app.use(express.json({ limit: '200kb' }));
-
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'same-origin');
-  next();
-});
+app.set('trust proxy', TRUST_PROXY ? 1 : false);
+app.use(securityHeaders({ https: TRUST_PROXY }));
+app.use('/api', sameOriginOnly);
+app.use(express.json({ limit: '100kb' }));
 
 // ---------- helpers ---------------------------------------------------------
 const ITEM_CATEGORY = Object.fromEntries(ALL_ITEMS.map((i) => [i.key, i.category]));
@@ -44,7 +45,7 @@ function readCookie(req, name) {
 }
 
 function setSessionCookie(req, res, token, maxAgeSec) {
-  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const secure = req.secure;
   res.setHeader(
     'Set-Cookie',
     `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${secure ? '; Secure' : ''}`
@@ -63,9 +64,10 @@ function auth(req, res, next) {
   const row = db
     .prepare(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
               WHERE s.token = ? AND s.expires_at > datetime('now') AND u.active = 1`)
-    .get(token);
+    .get(hashToken(token));
   if (!row) return res.status(401).json({ error: 'auth_required' });
   req.user = row;
+  req.sessionHash = hashToken(token);
   next();
 }
 
@@ -89,54 +91,56 @@ const today = () => daysAgo(0);
 const clean = (v, max = 2000) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
 
 // ---------- auth ------------------------------------------------------------
-const loginAttempts = new Map();
-app.post('/api/auth/login', (req, res) => {
-  const ip = req.ip;
-  const a = loginAttempts.get(ip) || { n: 0, t: Date.now() };
-  if (Date.now() - a.t > 15 * 60000) Object.assign(a, { n: 0, t: Date.now() });
-  if (a.n >= 10) return res.status(429).json({ error: 'too_many_attempts' });
-
-  const email = clean(req.body?.email, 200);
-  const password = String(req.body?.password || '');
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  if (!user || !user.active || !verifyPassword(password, user.password_hash)) {
-    a.n++; loginAttempts.set(ip, a);
-    return res.status(401).json({ error: 'invalid_credentials' });
-  }
-  loginAttempts.delete(ip);
+function startSession(req, res, userId) {
   const token = newToken();
   db.prepare(`INSERT INTO sessions (token,user_id,expires_at) VALUES (?,?,datetime('now', ?))`)
-    .run(token, user.id, `+${SESSION_DAYS} days`);
+    .run(hashToken(token), userId, `+${SESSION_DAYS} days`);
   db.prepare(`DELETE FROM sessions WHERE expires_at <= datetime('now')`).run();
   setSessionCookie(req, res, token, SESSION_DAYS * 86400);
+}
+
+const loginByIp = new RateLimiter({ windowMs: 15 * 60000, max: 20 });
+const loginByEmail = new RateLimiter({ windowMs: 15 * 60000, max: 8 });
+const registerByIp = new RateLimiter({ windowMs: 60 * 60000, max: 8 });
+const mailBySupervisor = new RateLimiter({ windowMs: 60 * 60000, max: 40 });
+app.post('/api/auth/login', async (req, res) => {
+  const email = clean(req.body?.email, 200).toLowerCase();
+  const password = String(req.body?.password || '').slice(0, 256);
+  // Per-IP and per-account limits: slows down both spraying and targeted guessing.
+  if (loginByIp.blocked(req.ip) || loginByEmail.blocked(email)) return res.status(429).json({ error: 'too_many_attempts' });
+
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  // Always run scrypt, even for unknown emails, so timing does not reveal which accounts exist.
+  const ok = await verifyPassword(password, user ? user.password_hash : DUMMY_HASH);
+  if (!user || !user.active || !ok) {
+    loginByIp.hit(req.ip); loginByEmail.hit(email);
+    return res.status(401).json({ error: 'invalid_credentials' });
+  }
+  loginByEmail.reset(email);
+  startSession(req, res, user.id);
   res.json({ user: publicUser(user) });
 });
 
 // Public self-registration: always creates a *worker*, assigned to the default supervisor
 // (the first active supervisor) so the new card history is visible to someone.
-const registerAttempts = new Map();
-app.post('/api/auth/register', (req, res) => {
-  const ip = req.ip;
-  const a = registerAttempts.get(ip) || { n: 0, t: Date.now() };
-  if (Date.now() - a.t > 60 * 60000) Object.assign(a, { n: 0, t: Date.now() });
-  if (a.n >= 8) return res.status(429).json({ error: 'too_many_attempts' });
-  a.n++; registerAttempts.set(ip, a);
+app.post('/api/auth/register', async (req, res) => {
+  if (registerByIp.blocked(req.ip)) return res.status(429).json({ error: 'too_many_attempts' });
+  registerByIp.hit(req.ip);
 
   const b = req.body || {};
-  const name = clean(b.name, 120), email = clean(b.email, 200), observer_id = clean(b.observer_id, 40);
+  const name = clean(b.name, 120), email = clean(b.email, 200).toLowerCase(), observer_id = clean(b.observer_id, 40);
   const craft = clean(b.craft, 80), password = String(b.password || ''), confirm = String(b.confirm || '');
-  if (!name || !observer_id || !craft || !/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'missing_fields' });
-  if (password.length < 8) return res.status(400).json({ error: 'password_too_short' });
-  if (password.length > 200 || password !== confirm) return res.status(400).json({ error: 'password_mismatch' });
+  if (!name || !observer_id || !craft || !EMAIL_RE.test(email)) return res.status(400).json({ error: 'missing_fields' });
+  const weak = passwordProblem(password);
+  if (weak) return res.status(400).json({ error: weak });
+  if (password !== confirm) return res.status(400).json({ error: 'password_mismatch' });
 
   const sup = db.prepare(`SELECT id FROM users WHERE role = 'supervisor' AND active = 1 ORDER BY id LIMIT 1`).get();
   try {
     const r = db.prepare(`INSERT INTO users (name,email,password_hash,role,observer_id,craft,supervisor_id) VALUES (?,?,?,?,?,?,?)`)
-      .run(name, email, hashPassword(password), 'worker', observer_id, craft, sup?.id ?? null);
+      .run(name, email, await hashPassword(password), 'worker', observer_id, craft, sup?.id ?? null);
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(r.lastInsertRowid));
-    const token = newToken();
-    db.prepare(`INSERT INTO sessions (token,user_id,expires_at) VALUES (?,?,datetime('now', ?))`).run(token, user.id, `+${SESSION_DAYS} days`);
-    setSessionCookie(req, res, token, SESSION_DAYS * 86400);
+    startSession(req, res, user.id);
     res.status(201).json({ user: publicUser(user) });
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) return res.status(409).json({ error: 'duplicate_user' });
@@ -146,7 +150,7 @@ app.post('/api/auth/register', (req, res) => {
 
 app.post('/api/auth/logout', (req, res) => {
   const token = readCookie(req, COOKIE);
-  if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(hashToken(token));
   setSessionCookie(req, res, '', 0);
   res.json({ ok: true });
 });
@@ -158,14 +162,23 @@ app.get('/api/auth/me', auth, (req, res) => {
   res.json({ user: { ...publicUser(req.user), supervisor_name: sup?.name || null }, mail_configured: mailConfigured() });
 });
 
-app.post('/api/me/password', auth, (req, res) => {
+const pwChangeByUser = new RateLimiter({ windowMs: 15 * 60000, max: 6 });
+app.post('/api/me/password', auth, async (req, res) => {
+  if (pwChangeByUser.blocked(req.user.id)) return res.status(429).json({ error: 'too_many_attempts' });
   const { current, next: nextPw } = req.body || {};
-  if (!verifyPassword(String(current || ''), req.user.password_hash))
+  if (!(await verifyPassword(String(current || '').slice(0, 256), req.user.password_hash))) {
+    pwChangeByUser.hit(req.user.id);
     return res.status(400).json({ error: 'wrong_password' });
-  if (String(nextPw || '').length < 8) return res.status(400).json({ error: 'password_too_short' });
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(nextPw), req.user.id);
+  }
+  const weak = passwordProblem(nextPw);
+  if (weak) return res.status(400).json({ error: weak });
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(await hashPassword(nextPw), req.user.id);
+  // Sign out every other device; keep the current session.
+  db.prepare('DELETE FROM sessions WHERE user_id = ? AND token <> ?').run(req.user.id, req.sessionHash);
   res.json({ ok: true });
 });
+
+app.get('/api/config', (_req, res) => res.json({ demo: DEMO_MODE }));
 
 // ---------- checklist ---------------------------------------------------------
 app.get('/api/checklist', (_req, res) => res.json({ checklist: CHECKLIST }));
@@ -277,15 +290,14 @@ app.get('/api/cards/:id/pdf', auth, async (req, res) => {
 
 // Supervisor emails the card PDF — by default to the email of the card's owner
 // (the address entered when the account was created).
-const mailCounts = new Map();
 app.post('/api/cards/:id/email', auth, supervisorOnly, async (req, res) => {
   const card = loadCard(req, res);
   if (!card) return;
-  const m = mailCounts.get(req.user.id) || { n: 0, t: Date.now() };
-  if (Date.now() - m.t > 60 * 60000) Object.assign(m, { n: 0, t: Date.now() });
-  if (m.n >= 40) return res.status(429).json({ error: 'too_many_attempts' });
-  const to = clean(req.body?.to, 200) || card.user_email;
-  if (!/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(to)) return res.status(400).json({ error: 'invalid_email' });
+  if (mailBySupervisor.blocked(req.user.id)) return res.status(429).json({ error: 'too_many_attempts' });
+  // The recipient is always the card owner's registered email — never a client-supplied
+  // address — so the endpoint cannot be abused to send mail to arbitrary people.
+  const to = card.user_email;
+  if (!EMAIL_RE.test(to)) return res.status(400).json({ error: 'invalid_email' });
   const lang = pickLang(req.body?.lang);
   const full = withRatings(card);
   try {
@@ -295,7 +307,7 @@ app.post('/api/cards/:id/email', auth, supervisorOnly, async (req, res) => {
       to, subject, html, text, replyTo: req.user.email,
       attachments: [{ filename: `HERO-Card-${card.id}.pdf`, content: pdf, contentType: 'application/pdf' }],
     });
-    m.n++; mailCounts.set(req.user.id, m);
+    mailBySupervisor.hit(req.user.id);
     res.json({ ok: true, to, mode: r.mode });
   } catch (e) {
     console.error('email failed:', e.message);
@@ -424,16 +436,17 @@ app.get('/api/users', auth, supervisorOnly, (req, res) => {
   res.json({ users: rows.map((u) => ({ ...publicUser(u), last_card: u.last_card, card_count: u.card_count })) });
 });
 
-app.post('/api/users', auth, supervisorOnly, (req, res) => {
+app.post('/api/users', auth, supervisorOnly, async (req, res) => {
   const b = req.body || {};
-  const name = clean(b.name, 120), email = clean(b.email, 200), observer_id = clean(b.observer_id, 40);
+  const name = clean(b.name, 120), email = clean(b.email, 200).toLowerCase(), observer_id = clean(b.observer_id, 40);
   const craft = clean(b.craft, 80), password = String(b.password || '');
   const role = b.role === 'supervisor' ? 'supervisor' : 'worker';
-  if (!name || !/^\S+@\S+\.\S+$/.test(email) || !observer_id) return res.status(400).json({ error: 'missing_fields' });
-  if (password.length < 8) return res.status(400).json({ error: 'password_too_short' });
+  if (!name || !EMAIL_RE.test(email) || !observer_id) return res.status(400).json({ error: 'missing_fields' });
+  const weak = passwordProblem(password);
+  if (weak) return res.status(400).json({ error: weak });
   try {
     const r = db.prepare(`INSERT INTO users (name,email,password_hash,role,observer_id,craft,supervisor_id) VALUES (?,?,?,?,?,?,?)`)
-      .run(name, email, hashPassword(password), role, observer_id, craft || null, req.user.id);
+      .run(name, email, await hashPassword(password), role, observer_id, craft || null, req.user.id);
     res.status(201).json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(Number(r.lastInsertRowid))) });
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) return res.status(409).json({ error: 'duplicate_user' });
@@ -441,7 +454,7 @@ app.post('/api/users', auth, supervisorOnly, (req, res) => {
   }
 });
 
-app.patch('/api/users/:id', auth, supervisorOnly, (req, res) => {
+app.patch('/api/users/:id', auth, supervisorOnly, async (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE id = ? AND supervisor_id = ?').get(Number(req.params.id), req.user.id);
   if (!u) return res.status(404).json({ error: 'not_found' });
   const b = req.body || {};
@@ -451,8 +464,10 @@ app.patch('/api/users/:id', auth, supervisorOnly, (req, res) => {
   }
   if (b.craft !== undefined) db.prepare('UPDATE users SET craft = ? WHERE id = ?').run(clean(b.craft, 80) || null, u.id);
   if (b.password) {
-    if (String(b.password).length < 8) return res.status(400).json({ error: 'password_too_short' });
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(String(b.password)), u.id);
+    const weak = passwordProblem(b.password);
+    if (weak) return res.status(400).json({ error: weak });
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(await hashPassword(String(b.password)), u.id);
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id); // force re-login everywhere
   }
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(u.id)) });
 });
@@ -460,6 +475,7 @@ app.patch('/api/users/:id', auth, supervisorOnly, (req, res) => {
 // ---------- static / SPA ----------------------------------------------------------
 const PUBLIC = join(__dirname, '..', 'public');
 app.use(express.static(PUBLIC, {
+  dotfiles: 'ignore', index: 'index.html', redirect: false,
   setHeaders(res, path) {
     if (path.endsWith('sw.js') || path.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache');
     if (path.endsWith('.webmanifest')) res.setHeader('Content-Type', 'application/manifest+json');
@@ -469,6 +485,9 @@ app.use('/api', (_req, res) => res.status(404).json({ error: 'not_found' }));
 app.use((req, res) => res.sendFile(join(PUBLIC, 'index.html')));
 
 app.use((err, _req, res, _next) => {
+  // Malformed / oversized JSON → client error, without echoing details back.
+  if (err?.type === 'entity.parse.failed') return res.status(400).json({ error: 'bad_json' });
+  if (err?.type === 'entity.too.large') return res.status(413).json({ error: 'too_large' });
   console.error(err);
   res.status(500).json({ error: 'server_error' });
 });
