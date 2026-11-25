@@ -1,8 +1,8 @@
 // HERO Card service worker: app-shell cache + network-first API reads.
-const VERSION = 'hc-v4';
+const VERSION = 'hc-v5';
 const FONT_CACHE = 'hc-fonts-v1';
 const SHELL = [
-  '/', '/index.html', '/css/app.css', '/css/theme.css', '/manifest.webmanifest',
+  '/', '/index.html', '/css/app.css', '/css/theme.css', '/css/nav-auth.css', '/manifest.webmanifest',
   '/js/app.js', '/js/api.js', '/js/i18n.js', '/js/icons.js', '/js/checklist.js', '/js/charts.js',
   '/icons/icon.svg', '/icons/icon-192.png', '/icons/icon-512.png',
 ];

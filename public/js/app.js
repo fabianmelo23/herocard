@@ -114,9 +114,16 @@ function renderShell() {
         <div class="net-banner" hidden></div>
         <main id="view" class="view" tabindex="-1"></main>
       </div>
-      <nav class="tabbar">
-        ${navItems().map((n) => `<a href="${n.href}" data-nav="${n.href}" class="${n.fab ? 'tab-fab' : ''}" aria-label="${t(n.key)}">
-          ${n.fab ? `<span class="fab">${icon('plus', 26)}</span>` : `${icon(n.ic, 22)}<span>${t(n.key)}</span>`}</a>`).join('')}
+      <nav class="tabbar" aria-label="${t('nav_main')}">
+        <svg class="tab-bump" viewBox="0 0 96 66" aria-hidden="true">
+          <defs><linearGradient id="bumpFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" class="bump-stop-a"/><stop offset="1" class="bump-stop-b"/>
+          </linearGradient></defs>
+          <path class="bump-fill" d="M0 64.5 C24 64.5 26 7 48 7 C70 7 72 64.5 96 64.5 Z"/>
+          <path class="bump-line" d="M0 64.5 C24 64.5 26 7 48 7 C70 7 72 64.5 96 64.5"/>
+        </svg>
+        ${navItems().map((n) => `<a href="${n.href}" data-nav="${n.href}" aria-label="${t(n.key)}">
+          <i class="tab-ic">${icon(n.ic, 22)}</i><span>${t(n.key)}</span></a>`).join('')}
       </nav>
     </div>`;
   $('[data-logout]').addEventListener('click', logout);
@@ -164,6 +171,7 @@ function route() {
   const base = '#/' + (h.split('/')[1] || '');
   document.body.classList.toggle('is-form', base === '#/new');
   $$('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === (base === '#/' ? '#/' : base)));
+  placeBump();
   for (const [re, fn] of routes) {
     const m = h.match(re);
     if (m) {
@@ -177,6 +185,16 @@ function route() {
   location.hash = '#/';
 }
 addEventListener('hashchange', route);
+
+// Moves the neon "bump" of the mobile tab bar under the active tab (CSS animates the move).
+function placeBump() {
+  const bar = $('.tabbar');
+  if (!bar) return;
+  const a = $('a.active', bar);
+  bar.classList.toggle('has-active', !!a);
+  if (a) bar.style.setProperty('--bump-x', `${a.offsetLeft + a.offsetWidth / 2}px`);
+}
+addEventListener('resize', placeBump);
 
 // ---------------------------------------------------------------- login / register
 // Same rules as server/security.js (the server is the authority; this is just fast feedback).
@@ -200,83 +218,123 @@ document.addEventListener('click', (e) => {
   input.focus();
 });
 
+// Floating-label input with a leading icon (label stays visible: accessible, no placeholder-only labels).
+function flField({ id, name, type = 'text', label: text, ic, auto = 'off', extra = '', pw = false }) {
+  return `<div class="fl ${pw ? 'pw-wrap' : ''}">
+    <input id="${id}" name="${name}" type="${type}" placeholder=" " autocomplete="${auto}" required ${extra}/>
+    <label for="${id}">${text}</label>${icon(ic, 18, 'fl-ic')}
+    ${pw ? `<button type="button" class="pw-toggle" aria-label="${t('show_password')}" aria-pressed="false">${icon('eye', 20)}</button>` : ''}
+  </div>`;
+}
+
+// Decorative animated circuit board for the auth background (pure SVG, no assets).
+function circuitSvg() {
+  const traces = [
+    'M0 160 H260 L300 200 H520', 'M0 420 H140 L190 370 H360 L400 330', 'M1440 120 H1180 L1140 160 H960',
+    'M1440 380 H1270 L1230 420 H1080', 'M0 720 H220 L270 770 H480', 'M1440 760 H1210 L1160 710 H990',
+    'M330 0 V90 L370 130 V240', 'M1100 0 V70 L1060 110 V210', 'M620 900 V800 L660 760 V690', 'M880 900 V820 L840 780 V720',
+  ];
+  const nodes = [[520, 200], [400, 330], [960, 160], [1080, 420], [480, 770], [990, 710], [370, 240], [1060, 210], [660, 690], [840, 720], [260, 160], [1180, 120]];
+  return `<svg class="circuit" viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+    <g class="c-traces">${traces.map((d) => `<path d="${d}"/>`).join('')}</g>
+    <g class="c-pulses">${traces.map((d, i) => `<path d="${d}" style="animation-delay:${(i * 0.7) % 5}s"/>`).join('')}</g>
+    <g class="c-nodes">${nodes.map(([x, y], i) => `<circle cx="${x}" cy="${y}" r="5" style="animation-delay:${(i * 0.45) % 4}s"/>`).join('')}</g>
+  </svg>`;
+}
+
 function renderLogin(mode = 'login') {
   const reg = mode === 'register';
-  const es = getLang() === 'es';
-  const fields = reg ? `
-        <label class="field"><span>${t('name')}</span><input name="name" autocomplete="name" required maxlength="120"/></label>
-        <label class="field"><span>${t('email')}</span><input name="email" type="email" autocomplete="email" required inputmode="email"/></label>
-        <div class="two-col">
-          <label class="field"><span>${t('worker_id')}</span><input name="observer_id" autocomplete="off" required maxlength="40" placeholder="EMP-0000"/></label>
-          <label class="field"><span>${t('profession')}</span><input name="craft" autocomplete="organization-title" required maxlength="80" placeholder="${t('profession_ph')}"/></label>
-        </div>
-        ${pwField('password', t('password'), 'new-password', 'minlength="8"')}
-        ${pwField('confirm', t('repeat_password'), 'new-password', 'minlength="8"')}
-        <small class="hint">${t('pw_hint')}</small>` : `
-        <label class="field"><span>${t('email')}</span><input name="email" type="email" autocomplete="username" required inputmode="email"/></label>
-        ${pwField('password', t('password'), 'current-password')}`;
+  const langSwitch = `<div class="lang-switch auth-lang">${['en', 'es'].map((l) => `<button type="button" data-lang="${l}" class="${getLang() === l ? 'on' : ''}">${l === 'en' ? 'English' : 'Español'}</button>`).join('')}</div>`;
   $('#app').innerHTML = `
-  <div class="login">
-    <section class="login-hero">
-      <div class="login-hero-inner">
-        <img src="/icons/icon.svg" alt="" width="64" height="64"/>
-        <h1>HERO <span>Card</span></h1>
-        <p>${t('tagline')}</p>
-        <ul class="hero-points">
-          <li>${icon('smartphone', 18)} ${es ? 'Llénala desde el celular en 1 minuto' : 'Fill it from your phone in 1 minute'}</li>
-          <li>${icon('wifiOff', 18)} ${es ? 'Funciona sin conexión en campo' : 'Works offline in the field'}</li>
-          <li>${icon('chart', 18)} ${es ? 'Supervisores ven tendencias en tiempo real' : 'Supervisors see trends in real time'}</li>
-        </ul>
-      </div>
-    </section>
-    <section class="login-panel">
-      <form class="login-form" novalidate>
-        <div class="login-mobile-brand"><img src="/icons/icon.svg" alt="" width="52" height="52"/><h1>HERO <span>Card</span></h1></div>
-        <div><h2>${t(reg ? 'create_account' : 'sign_in')}</h2>${reg ? `<p class="muted small" style="margin-top:4px">${t('register_sub')}</p>` : ''}</div>
-        ${fields}
-        <p class="form-error" hidden></p>
-        <button class="btn btn-primary btn-lg btn-block" type="submit">${t(reg ? 'register' : 'sign_in')}</button>
-        <p class="switch-mode">${t(reg ? 'have_account' : 'no_account')} <button type="button" class="link" data-mode="${reg ? 'login' : 'register'}">${t(reg ? 'sign_in' : 'register_here')}</button></p>
-        <div class="lang-switch">${['en', 'es'].map((l) => `<button type="button" data-lang="${l}" class="${getLang() === l ? 'on' : ''}">${l === 'en' ? 'English' : 'Español'}</button>`).join('')}</div>
-        ${reg || !state.demo ? '' : `<details class="demo">
-          <summary>${icon('sparkles', 16)} ${t('demo_accounts')}</summary>
-          <div class="demo-grid">
-            <button type="button" data-demo="worker@herocard.app">${icon('hardhat', 18)}<div><b>${t('worker')}</b><span>worker@herocard.app</span></div></button>
-            <button type="button" data-demo="supervisor@herocard.app">${icon('chart', 18)}<div><b>${t('supervisor')}</b><span>supervisor@herocard.app</span></div></button>
+  <div class="auth ${reg ? 'is-register' : ''}">
+    ${circuitSvg()}
+    <header class="auth-brand"><img src="/icons/icon.svg" alt="" width="40" height="40"/><b>HERO <span>Card</span></b></header>
+    <main class="auth-card">
+      <section class="auth-pane auth-login" aria-hidden="${reg}">
+        <form class="auth-form" data-form="login" novalidate>
+          <h2>${t('sign_in')}</h2>
+          ${flField({ id: 'li-email', name: 'email', type: 'email', label: t('email'), ic: 'mail', auto: 'username', extra: 'inputmode="email"' })}
+          ${flField({ id: 'li-pw', name: 'password', type: 'password', label: t('password'), ic: 'key', auto: 'current-password', pw: true })}
+          <p class="form-error" hidden></p>
+          <button class="btn btn-primary btn-lg btn-block" type="submit">${t('sign_in')}</button>
+          <p class="switch-mode">${t('no_account')} <button type="button" class="link" data-mode="register">${t('register_here')}</button></p>
+          ${state.demo ? `<details class="demo">
+            <summary>${icon('sparkles', 16)} ${t('demo_accounts')}</summary>
+            <div class="demo-grid">
+              <button type="button" data-demo="worker@herocard.app">${icon('hardhat', 18)}<div><b>${t('worker')}</b><span>worker@herocard.app</span></div></button>
+              <button type="button" data-demo="supervisor@herocard.app">${icon('chart', 18)}<div><b>${t('supervisor')}</b><span>supervisor@herocard.app</span></div></button>
+            </div>
+            <p class="small">${t('demo_pw')}: <code>Hero2026!</code></p>
+          </details>` : ''}
+        </form>
+      </section>
+      <section class="auth-pane auth-register" aria-hidden="${!reg}">
+        <form class="auth-form" data-form="register" novalidate>
+          <h2>${t('create_account')}</h2>
+          ${flField({ id: 'rg-name', name: 'name', label: t('name'), ic: 'user', auto: 'name', extra: 'maxlength="120"' })}
+          ${flField({ id: 'rg-email', name: 'email', type: 'email', label: t('email'), ic: 'mail', auto: 'email', extra: 'inputmode="email"' })}
+          <div class="two-col">
+            ${flField({ id: 'rg-id', name: 'observer_id', label: t('worker_id'), ic: 'hash', extra: 'maxlength="40"' })}
+            ${flField({ id: 'rg-craft', name: 'craft', label: t('profession'), ic: 'hardhat', auto: 'organization-title', extra: 'maxlength="80"' })}
           </div>
-          <p class="muted small">${t('demo_pw')}: <code>Hero2026!</code></p>
-        </details>`}
-      </form>
-    </section>
+          ${flField({ id: 'rg-pw', name: 'password', type: 'password', label: t('password'), ic: 'key', auto: 'new-password', pw: true, extra: 'minlength="8"' })}
+          ${flField({ id: 'rg-pw2', name: 'confirm', type: 'password', label: t('repeat_password'), ic: 'key', auto: 'new-password', pw: true, extra: 'minlength="8"' })}
+          <small class="hint">${t('pw_hint')}</small>
+          <p class="form-error" hidden></p>
+          <button class="btn btn-primary btn-lg btn-block" type="submit">${t('register')}</button>
+          <p class="switch-mode">${t('have_account')} <button type="button" class="link" data-mode="login">${t('sign_in')}</button></p>
+        </form>
+      </section>
+      <aside class="auth-overlay" aria-hidden="true">
+        <div class="auth-msg msg-login"><img src="/icons/icon.svg" alt="" width="54" height="54"/><h3>${t('welcome_back')}</h3><p>${t('welcome_sub')}</p></div>
+        <div class="auth-msg msg-register"><img src="/icons/icon.svg" alt="" width="54" height="54"/><h3>${t('hello_friend')}</h3><p>${t('hello_sub')}</p></div>
+      </aside>
+    </main>
+    ${langSwitch}
   </div>`;
-  const form = $('.login-form');
-  $$('[data-lang]', form).forEach((b) => b.addEventListener('click', () => { setLang(b.dataset.lang); renderLogin(mode); }));
-  $$('[data-mode]', form).forEach((b) => b.addEventListener('click', () => renderLogin(b.dataset.mode)));
-  $$('[data-demo]', form).forEach((b) => b.addEventListener('click', () => {
-    form.email.value = b.dataset.demo; form.password.value = 'Hero2026!'; form.requestSubmit();
+
+  const root = $('.auth');
+  const setMode = (m) => {
+    mode = m;
+    root.classList.toggle('is-register', m === 'register');
+    $('.auth-login', root).setAttribute('aria-hidden', String(m === 'register'));
+    $('.auth-register', root).setAttribute('aria-hidden', String(m !== 'register'));
+    $$('.form-error', root).forEach((e) => (e.hidden = true));
+    setTimeout(() => $(`.auth-${m} input`, root)?.focus({ preventScroll: true }), 380);
+  };
+  $$('[data-mode]', root).forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
+  $$('[data-lang]', root).forEach((b) => b.addEventListener('click', () => { setLang(b.dataset.lang); renderLogin(mode); }));
+  const loginForm = $('[data-form="login"]', root);
+  $$('[data-demo]', root).forEach((b) => b.addEventListener('click', () => {
+    loginForm.email.value = b.dataset.demo; loginForm.password.value = 'Hero2026!'; loginForm.requestSubmit();
   }));
-  form.addEventListener('submit', async (e) => {
+
+  $$('.auth-form', root).forEach((form) => form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    const isReg = form.dataset.form === 'register';
     const btn = $('button[type=submit]', form), err = $('.form-error', form);
-    const label = t(reg ? 'register' : 'sign_in');
+    const label = t(isReg ? 'register' : 'sign_in');
     err.hidden = true;
-    const fail = (msg) => { err.textContent = msg; err.hidden = false; btn.disabled = false; btn.textContent = label; };
+    const fail = (msg) => { err.textContent = msg; err.hidden = false; btn.disabled = false; btn.textContent = label; form.classList.remove('shake'); void form.offsetWidth; form.classList.add('shake'); };
     let body;
-    if (reg) {
+    if (isReg) {
       body = Object.fromEntries(new FormData(form));
       if (Object.values(body).some((v) => !String(v).trim())) return fail(t('err_missing_fields'));
       const pwErr = passwordProblem(body.password);
       if (pwErr) return fail(t('err_' + pwErr));
       if (body.password !== body.confirm) return fail(t('err_password_mismatch'));
-    } else body = { email: form.email.value, password: form.password.value };
-    btn.disabled = true; btn.textContent = t(reg ? 'registering' : 'signing_in');
+    } else {
+      body = { email: form.email.value, password: form.password.value };
+      if (!body.email.trim() || !body.password) return fail(t('err_missing_fields'));
+    }
+    btn.disabled = true; btn.textContent = t(isReg ? 'registering' : 'signing_in');
     try {
-      const { user } = await api(reg ? '/api/auth/register' : '/api/auth/login', { method: 'POST', body });
+      const { user } = await api(isReg ? '/api/auth/register' : '/api/auth/login', { method: 'POST', body });
       state.user = user;
-      if (reg) toast(t('welcome_new'));
+      if (isReg) toast(t('welcome_new'));
       await boot();
     } catch (ex) { fail(errMsg(ex)); }
-  });
+  }));
 }
 
 // ---------------------------------------------------------------- worker home
@@ -516,6 +574,7 @@ function viewSubmitted(r, c) {
       </div>
     </div>`;
   $$('[data-nav]').forEach((a) => a.classList.remove('active'));
+  placeBump();
   document.body.classList.remove('is-form');
   history.replaceState(null, '', '#/done'); // lets "New card" navigate again
 }
