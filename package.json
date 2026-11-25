@@ -1,0 +1,20 @@
+{
+  "name": "herocard-digital",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Digital HERO Card – daily safety observation app (PWA) for workers and supervisors",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "icons": "node scripts/make-icons.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "nodemailer": "^10.6.1",
+    "pdfkit": "^0.21.0"
+  }
+}

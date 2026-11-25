@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# runtime data: SQLite database (user accounts, cards) and test email outbox
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# local tooling
+.claude/
+*.log
+.DS_Store
+Thumbs.db
